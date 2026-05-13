@@ -6,12 +6,17 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../constants/trivia_category_map.dart';
 import '../dialogs/game_score_dialog.dart';
-import '../services/question_generator_service.dart';
+import '../services/minute_mode_preparation_service.dart';
 import '../styles/question_style.dart';
 import '../widgets/app_background.dart';
 
 class UnlimitedModeScreen extends StatefulWidget {
-  const UnlimitedModeScreen({super.key});
+  const UnlimitedModeScreen({
+    super.key,
+    this.preparedRun,
+  });
+
+  final MinuteModePreparedRun? preparedRun;
 
   @override
   State<UnlimitedModeScreen> createState() => _UnlimitedModeScreenState();
@@ -52,6 +57,7 @@ class _UnlimitedModeScreenState extends State<UnlimitedModeScreen> {
   bool advanceScheduled = false;
   bool gameStarted = false;
   bool gemsDeducted = false;
+  bool preserveBackgroundPreparedRunOnExit = false;
 
   Timer? timer;
 
@@ -61,7 +67,30 @@ class _UnlimitedModeScreenState extends State<UnlimitedModeScreen> {
   @override
   void initState() {
     super.initState();
+    if (widget.preparedRun != null) {
+      loadingCategories = false;
+      startPreparedRun(widget.preparedRun!);
+      return;
+    }
     loadCategoryOptions();
+  }
+
+  void startPreparedRun(MinuteModePreparedRun run) {
+    questions = run.questions;
+    temporaryGameId = run.gameId;
+    selectedCategory = run.category;
+    loadingQuestions = false;
+    isPreparingRun = false;
+    runInProgress = true;
+    gameStarted = true;
+    timeLeft = runDurationSeconds;
+    currentQuestionIndex = 0;
+    roundScore = 0;
+    correctAnswersCount = 0;
+    selectedAnswer = null;
+    revealAnswers = false;
+    buildAnswers();
+    startRunTimer();
   }
 
   @override
@@ -265,110 +294,44 @@ class _UnlimitedModeScreenState extends State<UnlimitedModeScreen> {
   }
 
   Future<void> startRun() async {
-    final user = supabase.auth.currentUser;
     final category = selectedCategory;
 
-    if (user == null || category == null) {
+    if (category == null) {
       return;
     }
 
     setState(() {
       isPreparingRun = true;
-      loadingQuestions = true;
     });
 
-    try {
-      final latestProfile = await supabase
-          .from('user_profiles')
-          .select('gem_count')
-          .eq('id', user.id)
-          .single();
+    final queued = await MinuteModePreparationService.instance
+        .startPreparation(category: category);
+    if (!mounted) return;
 
-      final latestGemCount = (latestProfile['gem_count'] ?? 0) as int;
-      if (latestGemCount < gemEntryCost) {
-        throw Exception('Not enough gems to start Minute Mode.');
-      }
-
-      await supabase
-          .from('user_profiles')
-          .update({'gem_count': latestGemCount - gemEntryCost}).eq('id', user.id);
-      gemsDeducted = true;
-
-      final gameInsert = await supabase
-          .from('unlimited_mode')
-          .insert({
-            'creator_id': user.id,
-            'player_categories': {
-              user.id: [category],
-            },
-            'scores': {user.id: 0},
-            'status': 'active',
-          })
-          .select('id')
-          .single();
-
-      final gameId = (gameInsert['id'] ?? '').toString();
-      if (gameId.isEmpty) {
-        throw Exception('Failed to create unlimited mode game.');
-      }
-      temporaryGameId = gameId;
-
-      final generatedQuestions = await generateQuestionsForCategories(
-        categoryNames: [category],
-        round: 1,
-        questionTargetCountOverride: questionTargetCount,
-        allowedDifficultiesOverride: ['easy', 'medium', 'hard'],
-      );
-
-      final loadedQuestions = generatedQuestions;
-
-      if (loadedQuestions.length < questionTargetCount) {
-        throw Exception('Not enough questions generated for unlimited mode.');
-      }
-
-      if (!mounted) return;
-
-      setState(() {
-        questions = loadedQuestions;
-        loadingQuestions = false;
-        isPreparingRun = false;
-        runInProgress = true;
-        gameStarted = true;
-        timeLeft = runDurationSeconds;
-        currentQuestionIndex = 0;
-        roundScore = 0;
-        correctAnswersCount = 0;
-        selectedAnswer = null;
-        revealAnswers = false;
-      });
-
-      buildAnswers();
-      startRunTimer();
-    } catch (e) {
-      await cleanupTemporaryGameArtifacts();
-      await refundEntryCostIfNeeded(user.id);
-
-      if (!mounted) return;
-      await showDialog<void>(
-        context: context,
-        builder: (_) => AlertDialog(
-          title: const Text('Could not start mode'),
-          content: Text('An error occurred: $e'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('OK'),
-            ),
-          ],
-        ),
-      );
-    } finally {
-      if (!mounted) return;
-      setState(() {
-        isPreparingRun = false;
-        loadingQuestions = false;
-      });
+    if (queued) {
+      preserveBackgroundPreparedRunOnExit = true;
+      Navigator.pop(context);
+      return;
     }
+
+    setState(() {
+      isPreparingRun = false;
+    });
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Could not start mode'),
+        content: const Text(
+          'Minute Mode could not be queued. It may already be loading.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   void scheduleAdvance() {
@@ -566,12 +529,13 @@ class _UnlimitedModeScreenState extends State<UnlimitedModeScreen> {
 
   Future<void> abandonRunIfNeeded() async {
     timer?.cancel();
+    if (preserveBackgroundPreparedRunOnExit) {
+      return;
+    }
 
     if (!gameStarted && supabase.auth.currentUser != null) {
       await refundEntryCostIfNeeded(supabase.auth.currentUser!.id);
     }
-
-    await cleanupTemporaryGameArtifacts();
   }
 
   Widget buildCategoryPicker() {
