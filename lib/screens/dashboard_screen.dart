@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -23,6 +25,7 @@ import '../widgets/split_game_avatar.dart';
 import '../widgets/app_background.dart';
 
 //Services
+import '../services/minute_mode_preparation_service.dart';
 import '../services/question_generator_service.dart';
 
 class DashboardScreen extends StatefulWidget
@@ -153,12 +156,104 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   late UserProfile profile;
+  final minuteModePreparation = MinuteModePreparationService.instance;
 
   @override
   void initState()
   {
     super.initState();
     profile = widget.userProfile;
+    minuteModePreparation.addListener(onMinuteModePreparationChanged);
+    unawaited(minuteModePreparation.restorePreparedRun());
+  }
+
+  @override
+  void dispose()
+  {
+    minuteModePreparation.removeListener(onMinuteModePreparationChanged);
+    super.dispose();
+  }
+
+  void onMinuteModePreparationChanged()
+  {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  ButtonStyle minuteModeButtonStyle()
+  {
+    final status = minuteModePreparation.status;
+    if (status == MinuteModePreparationStatus.pending)
+    {
+      return DashboardStyles.startGameButtonStyle.copyWith(
+        backgroundColor: MaterialStateProperty.all(const Color(0xFFE53935)),
+        foregroundColor: MaterialStateProperty.all(Colors.white),
+      );
+    }
+    if (status == MinuteModePreparationStatus.ready)
+    {
+      return DashboardStyles.startGameButtonStyle.copyWith(
+        backgroundColor: MaterialStateProperty.all(const Color(0xFF2E7D32)),
+        foregroundColor: MaterialStateProperty.all(Colors.white),
+      );
+    }
+    return DashboardStyles.startGameButtonStyle;
+  }
+
+  Future<void> showMinuteModePendingDialog() async
+  {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Minute Mode"),
+        content: const Text("Minute Mode is still loading."),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Close"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> showMinuteModeReadyDialog() async
+  {
+    final shouldStart = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Minute Mode"),
+        content: const Text("Ready to play Minute Mode."),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Back"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text("Start"),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldStart != true || !mounted) return;
+
+    await minuteModePreparation.markRunActive();
+    final run = minuteModePreparation.consumePreparedRun();
+    if (run == null) return;
+
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => UnlimitedModeScreen(preparedRun: run),
+      ),
+    );
+
+    if (!mounted) return;
+    await purgeEndedUnlimitedModeGames();
+    await refreshUserProfile();
+    setState(() {});
   }
 
   Future<void> refreshUserProfile() async
@@ -1057,6 +1152,18 @@ Future<void> onEndedGameTap(Game game) async
                          child: ElevatedButton(
                            onPressed: () async
                            {
+                             if (minuteModePreparation.isPending)
+                             {
+                               await showMinuteModePendingDialog();
+                               return;
+                             }
+
+                             if (minuteModePreparation.isReady)
+                             {
+                               await showMinuteModeReadyDialog();
+                               return;
+                             }
+
                              final client = Supabase.instance.client;
                              final user = client.auth.currentUser;
                              if (user == null) return;
@@ -1102,7 +1209,7 @@ Future<void> onEndedGameTap(Game game) async
                               await refreshUserProfile();
                               setState(() {});
                             },
-                           style: DashboardStyles.startGameButtonStyle,
+                           style: minuteModeButtonStyle(),
                            child: const Text("Minute Mode", style: TextStyle(fontSize: 25, fontWeight: FontWeight.w100)),
                          ),
                        ),
