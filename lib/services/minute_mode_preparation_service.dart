@@ -47,6 +47,9 @@ class MinuteModePreparationService extends ChangeNotifier {
   bool get isReady => _status == MinuteModePreparationStatus.ready;
 
   Future<void> restorePreparedRun() async {
+    _preparedRun = null;
+    _status = MinuteModePreparationStatus.idle;
+
     final user = _supabase.auth.currentUser;
     if (user == null) {
       return;
@@ -60,6 +63,20 @@ class MinuteModePreparationService extends ChangeNotifier {
 
     try {
       final payload = jsonDecode(raw) as Map<String, dynamic>;
+      final statusRaw = (payload['status'] ?? '').toString();
+      final status = _statusFromStorage(statusRaw);
+
+      if (status == MinuteModePreparationStatus.pending) {
+        _status = MinuteModePreparationStatus.pending;
+        notifyListeners();
+        return;
+      }
+
+      if (status != MinuteModePreparationStatus.ready) {
+        await prefs.remove(_preparedRunStorageKeyForUser(user.id));
+        return;
+      }
+
       final gameId = (payload['game_id'] ?? '').toString();
       final category = (payload['category'] ?? '').toString();
       final questionsRaw = (payload['questions'] as List<dynamic>? ?? const []);
@@ -78,7 +95,7 @@ class MinuteModePreparationService extends ChangeNotifier {
         category: category,
         questions: questions,
       );
-      _status = MinuteModePreparationStatus.ready;
+      _status = status;
       notifyListeners();
     } catch (_) {
       await prefs.remove(_preparedRunStorageKeyForUser(user.id));
@@ -92,6 +109,7 @@ class MinuteModePreparationService extends ChangeNotifier {
     if (user == null) return false;
 
     _status = MinuteModePreparationStatus.pending;
+    await persistStatusOnly();
     notifyListeners();
     unawaited(_runPreparation(userId: user.id, category: category));
     return true;
@@ -113,6 +131,7 @@ class MinuteModePreparationService extends ChangeNotifier {
 
       final latestGemCount = (latestProfile['gem_count'] ?? 0) as int;
       if (latestGemCount < gemEntryCost) {
+        await clearPersistedPreparedRun();
         _status = MinuteModePreparationStatus.idle;
         notifyListeners();
         return;
@@ -225,6 +244,44 @@ class MinuteModePreparationService extends ChangeNotifier {
     return '$_preparedRunStorageKey:$userId';
   }
 
+  MinuteModePreparationStatus _statusFromStorage(String value) {
+    switch (value) {
+      case 'pending':
+        return MinuteModePreparationStatus.pending;
+      case 'ready':
+        return MinuteModePreparationStatus.ready;
+      default:
+        return MinuteModePreparationStatus.idle;
+    }
+  }
+
+  String _statusToStorage(MinuteModePreparationStatus status) {
+    switch (status) {
+      case MinuteModePreparationStatus.pending:
+        return 'pending';
+      case MinuteModePreparationStatus.ready:
+        return 'ready';
+      case MinuteModePreparationStatus.idle:
+        return 'idle';
+    }
+  }
+
+  Future<void> persistStatusOnly() async {
+    final user = _supabase.auth.currentUser;
+    if (user == null) {
+      return;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final payload = {
+      'status': _statusToStorage(_status),
+    };
+    await prefs.setString(
+      _preparedRunStorageKeyForUser(user.id),
+      jsonEncode(payload),
+    );
+  }
+
   Future<void> persistPreparedRun() async {
     final user = _supabase.auth.currentUser;
     final run = _preparedRun;
@@ -234,6 +291,7 @@ class MinuteModePreparationService extends ChangeNotifier {
 
     final prefs = await SharedPreferences.getInstance();
     final payload = {
+      'status': _statusToStorage(MinuteModePreparationStatus.ready),
       'game_id': run.gameId,
       'category': run.category,
       'questions': run.questions,
